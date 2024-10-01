@@ -11,6 +11,8 @@ Xu Liu, Wei Peng, Xiaoya Zhang, Xiaoyu Zhao, Weien Zhou, Wen Yao, and Xiaoqian C
 Author: Xu Liu
 This repository contains
 1. cylinder2D case:
+   - The training dataset file Cy_Taira.pickle in "cylinder2D/data" can be download in
+https://modelscope.cn/datasets/shanliwa/ReconstructionDataset/files
    - DSPO_fno_cy.py: train FNO with DSPO.
    - DSPO_gnn_cy.py: train GCN with DSPO.
    - DSPO_mlp_cnn_cy.py: train GCN with DSPO.
@@ -21,6 +23,7 @@ This repository contains
    - sensor_ini.py: load the init placement.
 2. models file: reconstruction models including CNN, MLP, PODNN, GCN, FNO, Senseiver and so on.
 3. utils file: files including differential operator.
+
 
 # Requirements
 - python 3.X (>3.8)
