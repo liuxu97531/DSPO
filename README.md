@@ -5,6 +5,7 @@ The present framework co-optimize sensor placement and field reconstructions bas
 # Reference
 Xu Liu, Wei Peng, Xiaoya Zhang, Xiaoyu Zhao, Weien Zhou, Wen Yao, and Xiaoqian Chen, "Enhancing deep learning-based field reconstruction with differentiable learning framework,", arXiv preprint arXiv:.
 
+![DSPO](https://github.com/liuxu97531/DSPO/blob/main/fig/DSPO.png?raw=true)
 
 # Information
 Author: Xu Liu
