@@ -1,0 +1,183 @@
+''' 
+This script demonstrates using the RBF-FD method to calculate static
+deformation of a three-dimensional elastic material subject to a uniform body
+force such as gravity. The elastic material has a fixed boundary condition on
+one side and the remaining sides have a free surface boundary condition.  This
+script also demonstrates using ghost nodes which, for all intents and purposes,
+are necessary when dealing with Neumann boundary conditions.
+'''
+import logging
+
+import numpy as np
+import scipy.sparse as sp
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
+from rbf.sputils import expand_rows
+from rbf.linalg import GMRESSolver
+from rbf.pde.nodes import poisson_disc_nodes
+from rbf.pde.elastic import (elastic3d_body_force,
+                             elastic3d_surface_force,
+                             elastic3d_displacement) 
+
+logging.basicConfig(level=logging.DEBUG)
+
+## User defined parameters
+#####################################################################
+# define the vertices of the problem domain. Note that the first two simplices
+# will be fixed, and the others will be free
+vert = np.array([[0.0, 0.0, 0.0],
+                 [0.0, 0.0, 1.0],
+                 [0.0, 1.0, 0.0],
+                 [0.0, 1.0, 1.0],
+                 [2.0, 0.0, 0.0],
+                 [2.0, 0.0, 1.0],
+                 [2.0, 1.0, 0.0],
+                 [2.0, 1.0, 1.0]])
+smp = np.array([[0, 1, 3],
+                [0, 2, 3],
+                [0, 1, 4],
+                [1, 5, 4],
+                [0, 2, 6],
+                [0, 4, 6],
+                [1, 7, 5],
+                [1, 3, 7],
+                [4, 5, 7],
+                [4, 6, 7],
+                [2, 3, 7],
+                [2, 6, 7]])
+# Node spacing
+dx = 0.15
+# lame parameters
+lamb = 1.0
+mu = 1.0
+# z component of body force
+body_force = 1.0
+# stencil size
+n = 50
+
+## Build and solve for displacements and strain
+#####################################################################
+# generate nodes. Note that this may take a while
+boundary_groups = {'fix':[0, 1], 'free':range(2, 12)}
+nodes, idx, normals = poisson_disc_nodes(
+    dx, 
+    (vert, smp),
+    boundary_groups=boundary_groups,
+    boundary_groups_with_ghosts=['free'])
+
+# The "left hand side" matrices are built with the convenience functions from
+# `rbf.pde.elastic`. Read the documentation for these functions to better
+# understand this step.
+N = nodes.shape[0]
+G_xx = sp.coo_matrix((N, N))
+G_xy = sp.coo_matrix((N, N))
+G_xz = sp.coo_matrix((N, N))
+
+G_yx = sp.coo_matrix((N, N))
+G_yy = sp.coo_matrix((N, N))
+G_yz = sp.coo_matrix((N, N))
+
+G_zx = sp.coo_matrix((N, N))
+G_zy = sp.coo_matrix((N, N))
+G_zz = sp.coo_matrix((N, N))
+
+out = elastic3d_body_force(nodes[idx['interior']], nodes, n,
+                           lamb=lamb, mu=mu)
+G_xx += expand_rows(out['xx'], idx['interior'], N)
+G_xy += expand_rows(out['xy'], idx['interior'], N)
+G_xz += expand_rows(out['xz'], idx['interior'], N)
+G_yx += expand_rows(out['yx'], idx['interior'], N)
+G_yy += expand_rows(out['yy'], idx['interior'], N)
+G_yz += expand_rows(out['yz'], idx['interior'], N)
+G_zx += expand_rows(out['zx'], idx['interior'], N)
+G_zy += expand_rows(out['zy'], idx['interior'], N)
+G_zz += expand_rows(out['zz'], idx['interior'], N)
+
+out = elastic3d_body_force(nodes[idx['boundary:free']], nodes, n,
+                           lamb=lamb, mu=mu)
+G_xx += expand_rows(out['xx'], idx['ghosts:free'], N)
+G_xy += expand_rows(out['xy'], idx['ghosts:free'], N)
+G_xz += expand_rows(out['xz'], idx['ghosts:free'], N)
+G_yx += expand_rows(out['yx'], idx['ghosts:free'], N)
+G_yy += expand_rows(out['yy'], idx['ghosts:free'], N)
+G_yz += expand_rows(out['yz'], idx['ghosts:free'], N)
+G_zx += expand_rows(out['zx'], idx['ghosts:free'], N)
+G_zy += expand_rows(out['zy'], idx['ghosts:free'], N)
+G_zz += expand_rows(out['zz'], idx['ghosts:free'], N)
+
+out = elastic3d_surface_force(nodes[idx['boundary:free']], 
+                              normals[idx['boundary:free']], 
+                              nodes, n, lamb=lamb, mu=mu)
+G_xx += expand_rows(out['xx'], idx['boundary:free'], N)
+G_xy += expand_rows(out['xy'], idx['boundary:free'], N)
+G_xz += expand_rows(out['xz'], idx['boundary:free'], N)
+G_yx += expand_rows(out['yx'], idx['boundary:free'], N)
+G_yy += expand_rows(out['yy'], idx['boundary:free'], N)
+G_yz += expand_rows(out['yz'], idx['boundary:free'], N)
+G_zx += expand_rows(out['zx'], idx['boundary:free'], N)
+G_zy += expand_rows(out['zy'], idx['boundary:free'], N)
+G_zz += expand_rows(out['zz'], idx['boundary:free'], N)
+
+out = elastic3d_displacement(nodes[idx['boundary:fix']], nodes, 1)
+G_xx += expand_rows(out['xx'], idx['boundary:fix'], N)
+G_yy += expand_rows(out['yy'], idx['boundary:fix'], N)
+G_zz += expand_rows(out['zz'], idx['boundary:fix'], N)
+
+G_x = sp.hstack((G_xx, G_xy, G_xz))
+G_y = sp.hstack((G_yx, G_yy, G_yz))
+G_z = sp.hstack((G_zx, G_zy, G_zz))
+G = sp.vstack((G_x, G_y, G_z))
+
+# build the right-hand-side vector
+d_x = np.zeros((N,))
+d_y = np.zeros((N,))
+d_z = np.ones((N,))
+
+d_x[idx['interior']] = 0.0
+d_x[idx['ghosts:free']] = 0.0
+d_x[idx['boundary:free']] = 0.0
+d_x[idx['boundary:fix']] = 0.0
+
+d_y[idx['interior']] = 0.0
+d_y[idx['ghosts:free']] = 0.0
+d_y[idx['boundary:free']] = 0.0
+d_y[idx['boundary:fix']] = 0.0
+
+d_z[idx['interior']] = body_force
+d_z[idx['ghosts:free']] = body_force
+d_z[idx['boundary:free']] = 0.0
+d_z[idx['boundary:fix']] = 0.0
+
+d = np.hstack((d_x, d_y, d_z))
+
+# solve it
+u = GMRESSolver(G).solve(d)
+u = np.reshape(u,(3,-1))
+u_x,u_y,u_z = u
+
+## Plot the results
+#####################################################################
+idx_int_and_bnd = np.hstack((idx['interior'],
+                             idx['boundary:free'],
+                             idx['boundary:fix']))
+
+nodes = nodes[idx_int_and_bnd]
+u_x,u_y,u_z = (u_x[idx_int_and_bnd],
+               u_y[idx_int_and_bnd],
+               u_z[idx_int_and_bnd])
+
+fig = plt.figure()
+ax = fig.add_subplot(111, projection='3d')
+#ax.set_aspect('equal')
+
+ax.plot_trisurf(vert[:,0], vert[:,1], vert[:,2], triangles=smp,
+                color=(0.1, 0.1, 0.1),  
+                shade=False, alpha=0.2)
+ax.quiver(nodes[:,0], nodes[:,1], nodes[:,2], u_x, u_y, u_z,
+          length=0.01, color='k')
+          
+ax.set_xlabel('x')
+ax.set_ylabel('y')
+ax.set_zlabel('z')
+plt.show()

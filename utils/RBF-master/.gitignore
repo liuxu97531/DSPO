@@ -1,0 +1,11 @@
+build
+dist
+*.egg*
+*~
+*.c
+*.pyc
+!rbf/_rbf_ufuncs/*.c
+rbf/_version.py
+rbf/*.html
+rbf/pde/*.html
+rbf/misc/*.html

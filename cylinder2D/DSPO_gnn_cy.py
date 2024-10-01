@@ -1,0 +1,201 @@
+# cython: language_level=3
+import pyximport
+pyximport.install()
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+from tqdm import trange
+import numpy as np
+import copy
+from torch.autograd import grad
+import torch
+from torch_geometric.nn import knn_graph
+from sensor_ini import Sensor_ini
+from CylinderDataset import CylinderDataset
+from DSPO_optimizer_cy import Solver_basic
+
+import sys
+sys.path.append('..')
+from model.mlp import MLP
+from model.gnn import GCN_NET
+from utils.utils import setup_seed
+from utils.default_options import parses
+
+f_npy = lambda x: x.cpu().detach().numpy()
+f_tensor = lambda x: torch.tensor(x).float().to(device)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+torch.cuda.device_count()
+class Solver_rec(Solver_basic):
+    def __init__(self,):
+        super().__init__(args)
+        encoder = MLP(layers=[args.num_obs, 2048, 112 * 192])
+        decoder = MLP(layers=[64, 64, 1])
+        hparams = {'encoder': [args.num_obs, 112 * 192, 3], 'decoder': [64, 64, 1], 'size_hidden_layers': 64}
+        # Build neural network
+        self.net = GCN_NET(hparams, encoder, decoder).to(self.device)
+        x, y = torch.linspace(0, 1, 192), torch.linspace(1, 0, 112)
+        x, y = torch.meshgrid(x, y)
+        self.pos = torch.cat([x.reshape(-1, 1), y.reshape(-1, 1)], dim=1).float()
+        self.edge_index = knn_graph(x=self.pos, loop=True, k=9)
+        self.pos = self.pos.to(self.device)
+        self.edge_index = self.edge_index.to(self.device)
+    def train(self, xobs_optimizer):
+        # Prepare the experiment environment
+        args.epochs, iter_obs_update = 300, 30
+        # args.epochs, iter_obs_update = 2, 2
+        xgrid_obs = self.xgrid_obs_ini
+        if not xobs_optimizer:
+            iter_obs_update = 1
+        for xgrid_obs_epoch in range(iter_obs_update):
+            y_obs_train = self.RBFInteploation_train(xgrid_obs)
+            dydx1_val, dydx2_val, y_obs_val = self.RBFInteploation_val(xgrid_obs)
+            dydx1_val_add = torch.where(dydx1_val > 0, 1e-2, -1e-2)
+            dydx2_val_add = torch.where(dydx2_val > 0, 1e-2, -1e-2)
+            dydx1_val += dydx1_val_add
+            dydx2_val += dydx2_val_add
+            train_loader, val_loader = (self.set_dataset(y_obs_train, self.y_train_exact),
+                                        self.set_dataset(y_obs_val, self.y_val_exact, shuffle=False))
+            self.optimizer = torch.optim.Adam(self.net.parameters(), lr=args.lr)
+            self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.98)
+            loss_history = []
+            # Build optimize
+            pbar = trange(args.epochs, desc='Epochs', disable=False)
+            for epoch in pbar:
+                # Training procedure
+                train_loss, train_num = 0., 0.
+                for i, (inputs, outputs) in enumerate(train_loader):
+                    inputs, outputs = inputs.to(self.device), outputs.to(self.device)
+                    pre = self.net(inputs, self.edge_index, self.pos).reshape(inputs.shape[0], -1)
+                    loss = self.criterion(outputs, pre)
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    self.optimizer.step()
+                    # Record results by tensorboard
+                    train_loss += loss.item() * inputs.shape[0]
+                    train_num += inputs.shape[0]
+                train_loss = self.std*train_loss / train_num
+                self.scheduler.step()
+
+                loss_history.append([train_loss])
+                pbar.set_postfix({'Train Loss': train_loss})
+
+            self.xgrid_obs_test = copy.deepcopy(xgrid_obs)
+            test_loss = self.Predict(loading=False)
+
+            # Value procedure
+            val_loss, val_num = 0., 0.
+            grad_y_obs_test = []
+            for i, (inputs, outputs) in enumerate(val_loader):
+                inputs, outputs = inputs.to(self.device), outputs.to(self.device)
+                inputs.requires_grad_(True)
+                pre = self.net(inputs, self.edge_index, self.pos).reshape(inputs.shape[0], -1)
+                loss = self.criterion(outputs, pre)
+                val_loss += loss.item() * inputs.shape[0]
+                val_num += inputs.shape[0]
+                grad_y_obs_batch = grad(loss, inputs, create_graph=False, retain_graph=True)[0]
+                grad_y_obs_test.append(grad_y_obs_batch)
+            grad_y_obs = torch.cat(grad_y_obs_test, dim=0) / len(val_loader)
+            val_loss = self.std*val_loss / val_num
+            # print(f'obs_updata {xgrid_obs_epoch}: Train Loss: {train_loss}, Val Loss: {val_loss}')
+            self.plot_train_loss(args, loss_history, val_loss, test_loss, xgrid_obs_epoch)
+            self.plot_obs_update(xgrid_obs, xgrid_obs_epoch, val_loss, test_loss, 'obs_log')
+
+            if val_loss <= self.best_val:
+                self.record_best(val_loss, test_loss, xgrid_obs, xgrid_obs_epoch)
+                self.plot_obs_update(xgrid_obs, xgrid_obs_epoch, val_loss, test_loss, 'best')
+            else:
+                self.worse_update += 1
+                self.best_rec.append([self.best_val, self.best_test])
+            # print('worse_update', self.worse_update)
+            with open(self.run_path, 'a') as f:
+                f.write(f'obs_updata {xgrid_obs_epoch}: Train Loss: {train_loss}, Val Loss: {val_loss} \n')
+                f.write(f'worse_update: {self.worse_update} \n')
+                f.write(f'test loss: {test_loss}\n\n')
+            # calculate grad
+            grad_x1_grid_obs = (grad_y_obs * dydx1_val).sum(dim=0).reshape(-1, 1)
+            grad_x2_grid_obs = (grad_y_obs * dydx2_val).sum(dim=0).reshape(-1, 1)
+            grad_x_grid_obs = torch.cat([grad_x1_grid_obs, grad_x2_grid_obs], dim=1)
+            xgrid_obs, self.exp_avg, self.exp_avg_sq, self.Step = self.optim_x_adam_revise(xgrid_obs, grad_x_grid_obs, self.exp_avg, self.exp_avg_sq,
+                                                                     self.Step)
+            if self.worse_update >= 6:
+                self.net = self.best_net_para
+                xgrid_obs = self.best_xgrid_obs
+                self.worse_update = 0
+        self.plot_optimizer_loss(args, self.best_rec)
+        self.save_error_log(args, self.best_net_para, self.best_xgrid_obs, self.best_xgrid_obs_log, self.best_rec)
+
+    def Predict(self, loading=True):
+        if loading:
+            self.net = torch.load(args.fig_path + f'/model/best_model.pth')
+            self.best_xgrid_obs = torch.load(args.fig_path + f'/model/best_obs.pth')
+            y_obs_test = self.RBFInteploation_test(self.best_xgrid_obs)
+            print('best result')
+        else:
+            y_obs_test = self.RBFInteploation_test(self.xgrid_obs_test)
+        test_loader = self.set_dataset(y_obs_test, self.y_test_exact, shuffle=False)
+        self.net.eval()
+        test_loss = 0.0
+        with torch.no_grad():
+            for batch in test_loader:
+                inputs, targets = batch
+                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                outputs = self.net(inputs, self.edge_index, self.pos).reshape(inputs.shape[0], -1)
+                # loss = self.criterion_test(outputs, targets)
+                loss = self.criterion_l2(outputs, targets) / self.y_mean_denom
+                test_loss += loss.item() * inputs.size(0)
+        test_loss = test_loss / len(test_loader.dataset)  # type: ignore
+        print('test loss', test_loss)
+        return test_loss
+
+    def plot_obs_update(self, xgrid_obs, i_plot, val_loss, test_loss, plot_save):
+        _, _, y_obs_val = self.RBFInteploation_val(xgrid_obs)
+        i = 0
+        u_val_plot = self.std*f_npy(self.y_val_exact[i:i + 1, :]).reshape(-1, 1)
+        input_val = y_obs_val[i:i + 1, :]
+        u_pred_plot = self.std*f_npy(self.net(input_val, self.edge_index, self.pos).reshape(-1, 1))
+        u_error_plot = abs(u_pred_plot - u_val_plot)
+        self.plot_obs(args, xgrid_obs, u_pred_plot, u_error_plot, u_val_plot, i_plot, val_loss, test_loss, plot_save)
+
+if __name__ == '__main__':
+    setup_seed(0)
+    args = parses()
+    args.model, args.test = 'gnn', 1
+    args.xs, args.y_exact_flatten, _ = CylinderDataset(index=[i for i in range(5000)])
+    args.n_power, args.ns = args.y_exact_flatten.shape[0], args.y_exact_flatten.shape[1]
+    args.num_obs = 16
+    Sensor_i = Sensor_ini(args.y_exact_flatten.T, args.xs, args.num_obs)
+    # args.xgrid_ini_methods = ['ConditionNumberSampler',
+    #            'DeterminantBasedSampler', 'EnhancedClusteringSampler', 'CorrelationClusteringSampler']
+    args.xgrid_ini_methods = ['UniformSampler']
+    for xgrid_ini_method in args.xgrid_ini_methods:
+        args.xgrid_ini_method = xgrid_ini_method
+        args.xgrid_obs_ini = Sensor_i.set_init(args)
+        Sensor_i.plot_ini()
+        NN_solver_rec = Solver_rec()
+        NN_solver_rec.train(xobs_optimizer = True)
+        NN_solver_rec.Predict(True)
+
+    # Test 2 RS 10
+    # setup_seed(0)
+    # args = parses()
+    # args.model, args.test = 'gnn', 1
+    # args.xs, args.y_exact_flatten, _ = CylinderDataset(index=[i for i in range(5000)])
+    # args.n_power, args.ns = args.y_exact_flatten.shape[0], args.y_exact_flatten.shape[1]
+    # best_test_loss_log = []
+    # for num_obs in [4, 8, 16]:
+    #     args.num_obs = num_obs
+    #     Sensor_i = Sensor_ini(args.y_exact_flatten.T, args.xs, args.num_obs)
+    #     best_test_loss = []
+    #     for i in range(30):
+    #         args.ckpt = 'logs/RandomSampler1'
+    #         args.test = i + 1
+    #         args.xgrid_ini_method = 'RandomSampler'
+    #         args.xgrid_obs_ini = Sensor_i.set_init_random(args)
+    #         Sensor_i.plot_ini()
+    #         NN_solver_rec = Solver_rec()
+    #         NN_solver_rec.train(xobs_optimizer=False)
+    #         test_loss = NN_solver_rec.Predict(True)
+    #         best_test_loss.append(test_loss)
+    #     np.save('./logs/RandomSampler/{}_best_test_loss_num_{}.npy'.format(args.model, args.num_obs), best_test_loss)
+    #     best_test_loss_log.append(best_test_loss)
+    #     print(args.num_obs, best_test_loss)
+    # np.save('./logs/RandomSampler1/{}_best_test_loss.npy'.format(args.model), best_test_loss_log)
